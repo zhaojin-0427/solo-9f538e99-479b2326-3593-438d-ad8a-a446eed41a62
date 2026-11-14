@@ -41,6 +41,17 @@ CREATE TABLE IF NOT EXISTS previews (
 
 CREATE INDEX IF NOT EXISTS idx_previews_date_status
     ON previews (date, status);
+
+CREATE TABLE IF NOT EXISTS maintenance_windows (
+    id          TEXT PRIMARY KEY,
+    station     TEXT NOT NULL,
+    start_ts    TEXT NOT NULL,  -- ISO 'YYYY-MM-DDTHH:00:00', inclusive
+    end_ts      TEXT NOT NULL,  -- ISO 'YYYY-MM-DDTHH:00:00', exclusive
+    created_at  TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_maintenance_station_range
+    ON maintenance_windows (station, start_ts, end_ts);
 """
 
 

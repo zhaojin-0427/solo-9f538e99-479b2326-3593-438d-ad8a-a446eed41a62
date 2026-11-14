@@ -18,6 +18,7 @@
     <nav class="nav" aria-label="主导航">
       <a href="#upload" class="nav-link active">上传与预览</a>
       <a href="#published" class="nav-link">已发布数据</a>
+      <a href="#maintenance" class="nav-link">停机检修</a>
     </nav>
   </header>
 
@@ -69,6 +70,12 @@
         <div class="alert-head"><strong>本批次存在冲突，整批已拒绝</strong></div>
         <p>同站同小时出现修订号相同但数值不同的记录。请修正源文件后重新上传，已发布数据未受影响。下方分类仅说明若不拒绝时的处理结果，本批不会写入任何记录。</p>
         <div id="conflict-list" class="conflict-list"></div>
+      </div>
+
+      <div id="maintenance-banner" class="alert error" hidden>
+        <div class="alert-head"><strong>批次涉及停机检修时段，整批已拒绝</strong></div>
+        <p>以下待发布读数落入已登记的停机时段（起始含、结束不含）。停机期间的读数不能进入下游分析，本批不会写入任何记录，已发布数据未受影响。</p>
+        <div id="maintenance-list" class="conflict-list"></div>
       </div>
 
       <div class="tabs" role="tablist" aria-label="记录分类">
@@ -137,10 +144,58 @@
         <pre id="day-json" class="json-view"></pre>
       </div>
     </section>
+
+    <section id="maintenance" class="panel">
+      <div class="panel-head">
+        <div>
+          <h2>停机检修登记</h2>
+          <p class="hint">起止均按整点填写，起始含、结束不含。时段内已有已发布读数时登记将被拒绝；登记成功后，落入该时段的待发布读数整批拒绝。</p>
+        </div>
+        <button type="button" id="refresh-maintenance" class="ghost">刷新列表</button>
+      </div>
+
+      <form id="maintenance-form" class="maintenance-form">
+        <label>站点
+          <input id="mx-station" type="text" required maxlength="120" placeholder="如 SY-001" autocomplete="off">
+        </label>
+        <label>起始整点（含）
+          <input id="mx-start" type="datetime-local" step="3600" required>
+        </label>
+        <label>结束整点（不含）
+          <input id="mx-end" type="datetime-local" step="3600" required>
+        </label>
+        <button type="submit" id="mx-submit" class="primary">登记停机</button>
+        <span id="mx-status" class="status" role="status" aria-live="polite"></span>
+      </form>
+
+      <div id="mx-error" class="alert error" hidden>
+        <div class="alert-head">
+          <strong>登记被拒绝</strong>
+          <button type="button" class="alert-close" aria-label="关闭">×</button>
+        </div>
+        <p id="mx-error-message"></p>
+        <ul id="mx-error-list" class="error-list"></ul>
+      </div>
+
+      <div class="table-wrap">
+        <table id="mx-table">
+          <thead>
+            <tr>
+              <th>站点</th>
+              <th>起始整点（含）</th>
+              <th>结束整点（不含）</th>
+              <th>登记时间</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+        <p id="mx-empty" class="empty" hidden>暂无停机记录。</p>
+      </div>
+    </section>
   </main>
 
   <footer class="footer">
-    <span>同站同小时以最高修订号为准 · 同修订号数值不一致则整批拒绝 · 发布为原子事务</span>
+    <span>同站同小时以最高修订号为准 · 同修订号数值不一致则整批拒绝 · 停机时段内读数不发布 · 发布为原子事务</span>
   </footer>
 
   <script src="/static/app.js"></script>

@@ -110,6 +110,18 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
     async def days() -> dict:
         return service.list_days(app.state.db_path)
 
+    @app.post("/api/maintenance", status_code=201)
+    async def register_maintenance(request: Request) -> dict:
+        try:
+            payload = await request.json()
+        except Exception:
+            raise service.InvalidMaintenanceWindow("请求体必须是有效的 JSON 对象")
+        return service.register_maintenance(app.state.db_path, payload)
+
+    @app.get("/api/maintenance")
+    async def maintenance(station: str | None = None) -> dict:
+        return service.list_maintenance(app.state.db_path, station)
+
     def _validate_day(day: str) -> JSONResponse | None:
         if not DATE_PATTERN.match(day):
             return JSONResponse(

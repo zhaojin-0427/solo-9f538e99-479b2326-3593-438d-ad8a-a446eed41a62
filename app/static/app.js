@@ -133,7 +133,12 @@
       } else if (response.status === 409 && data && data.detail) {
         state.preview = data.detail;
         renderPreview();
-        setStatus(uploadStatus, "批次存在冲突，已被整批拒绝。");
+        setStatus(
+          uploadStatus,
+          data.error === "maintenance_blocked"
+            ? "批次涉及停机检修时段，已被整批拒绝。"
+            : "批次存在冲突，已被整批拒绝。"
+        );
       } else {
         state.preview = null;
         renderGenericError(data);
@@ -153,6 +158,7 @@
     $("#publish-result").hidden = true;
     $("#stale-banner").hidden = true;
     $("#conflict-banner").hidden = true;
+    $("#maintenance-banner").hidden = true;
     $("#preview-panel").hidden = true;
   }
 
@@ -204,9 +210,15 @@
 
     const meta = $("#preview-meta");
     meta.innerHTML = "";
+    const statusChip =
+      preview.status === "conflict"
+        ? "已拒绝"
+        : preview.status === "blocked"
+          ? "停机拒绝"
+          : `日版本 v${preview.day_version}`;
     const chips = [
       preview.date ? formatDate(preview.date) : "日期未知",
-      preview.status === "conflict" ? "已拒绝" : `日版本 v${preview.day_version}`,
+      statusChip,
       `${preview.counts.rows} 行记录`,
     ];
     chips.forEach((text, index) => {
@@ -244,6 +256,14 @@
       renderConflictDetails(preview.conflicts);
     } else {
       conflictBanner.hidden = true;
+    }
+
+    const maintenanceBanner = $("#maintenance-banner");
+    if (preview.status === "blocked") {
+      maintenanceBanner.hidden = false;
+      renderMaintenanceConflicts(preview.maintenance_conflicts || []);
+    } else {
+      maintenanceBanner.hidden = true;
     }
 
     const confirmBar = $(".confirm-bar");
@@ -284,6 +304,20 @@
       )}:00 · r${conflict.revision}</strong><br>${reasonText}；上传值：${conflict.values
         .map((value) => `<code>${escapeHtml(value)}</code>`)
         .join(" / ")}（第 ${conflict.rows.join("、")} 行）`;
+      holder.appendChild(item);
+    });
+  }
+
+  function renderMaintenanceConflicts(hits) {
+    const holder = $("#maintenance-list");
+    holder.innerHTML = "";
+    hits.forEach((hit) => {
+      const item = document.createElement("div");
+      item.className = "conflict-item";
+      item.innerHTML =
+        `<strong>${escapeHtml(hit.station)} · ${escapeHtml(String(hit.timestamp).replace("T", " "))}</strong><br>` +
+        `落入停机时段 <code>${escapeHtml(String(hit.window_start).replace("T", " "))}</code> 至 ` +
+        `<code>${escapeHtml(String(hit.window_end).replace("T", " "))}</code>（结束不含）`;
       holder.appendChild(item);
     });
   }
@@ -392,6 +426,14 @@
         $("#stale-banner").hidden = false;
         $(".confirm-bar").hidden = true;
         setStatus(confirmStatus, "预览已失效，请重新上传。");
+      } else if (data && data.error === "preview_blocked") {
+        preview.status = "blocked";
+        preview.maintenance_conflicts =
+          (data.detail && data.detail.maintenance_conflicts) || [];
+        $("#maintenance-banner").hidden = false;
+        renderMaintenanceConflicts(preview.maintenance_conflicts);
+        $(".confirm-bar").hidden = true;
+        setStatus(confirmStatus, data.message || "预览涉及停机检修时段，已失效。");
       } else if (data && data.error === "preview_rejected") {
         setStatus(confirmStatus, data.message || "该批次已被整批拒绝。");
       } else if (data && data.error === "preview_not_found") {
@@ -521,11 +563,108 @@
 
   $("#refresh-days").addEventListener("click", loadDays);
 
+  /* ---------------- maintenance windows ---------------- */
+
+  const mxStatus = $("#mx-status");
+
+  function showMaintenanceError(message, lines, totalCount) {
+    const box = $("#mx-error");
+    box.hidden = false;
+    $("#mx-error-message").textContent = message || "登记被拒绝。";
+    const list = $("#mx-error-list");
+    list.innerHTML = "";
+    lines.forEach((line) => {
+      const li = document.createElement("li");
+      li.textContent = line;
+      list.appendChild(li);
+    });
+    if (totalCount && totalCount > lines.length) {
+      const li = document.createElement("li");
+      li.textContent = `另有 ${totalCount - lines.length} 个冲突时刻未显示。`;
+      list.appendChild(li);
+    }
+  }
+
+  $("#maintenance-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (state.busy) return;
+    state.busy = true;
+    $("#mx-submit").disabled = true;
+    $("#mx-error").hidden = true;
+    setStatus(mxStatus, "正在登记…", true);
+
+    const payload = {
+      station: $("#mx-station").value.trim(),
+      start: $("#mx-start").value,
+      end: $("#mx-end").value,
+    };
+
+    try {
+      const response = await fetch("/api/maintenance", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const data = await readJson(response);
+
+      if (response.ok) {
+        setStatus(mxStatus, `已登记 ${data.station} 的停机时段（${data.start.replace("T", " ")} 至 ${data.end.replace("T", " ")}，结束不含）。`);
+        await loadMaintenance();
+      } else if (response.status === 409 && data && data.detail) {
+        const detail = data.detail;
+        const lines = (detail.conflicts || []).map(
+          (item) => `${item.station} · ${String(item.timestamp).replace("T", " ")} 已有已发布读数`
+        );
+        showMaintenanceError(data.message, lines, detail.conflict_count);
+        setStatus(mxStatus, "登记被拒绝：时段内已有已发布读数。");
+      } else {
+        showMaintenanceError((data && data.message) || "登记失败，请检查输入。", []);
+        setStatus(mxStatus, "登记被拒绝。");
+      }
+    } catch (error) {
+      setStatus(mxStatus, `登记请求失败：${error.message}，请重试。`);
+    } finally {
+      state.busy = false;
+      $("#mx-submit").disabled = false;
+    }
+  });
+
+  async function loadMaintenance() {
+    const tbody = $("#mx-table tbody");
+    const empty = $("#mx-empty");
+    try {
+      const response = await fetch("/api/maintenance");
+      const data = await readJson(response);
+      if (!response.ok) throw new Error((data && data.message) || "无法读取停机记录");
+      const windows = (data && data.windows) || [];
+      tbody.innerHTML = "";
+      empty.hidden = windows.length > 0;
+      if (!windows.length) empty.textContent = "暂无停机记录。";
+      windows.forEach((window) => {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+          <td>${escapeHtml(window.station)}</td>
+          <td class="mono">${escapeHtml(String(window.start).replace("T", " "))}</td>
+          <td class="mono">${escapeHtml(String(window.end).replace("T", " "))}</td>
+          <td class="mono">${new Date(window.created_at).toLocaleString()}</td>
+        `;
+        tbody.appendChild(tr);
+      });
+    } catch (error) {
+      tbody.innerHTML = "";
+      empty.hidden = false;
+      empty.textContent = `加载失败：${error.message}`;
+    }
+  }
+
+  $("#refresh-maintenance").addEventListener("click", loadMaintenance);
+
   document.querySelectorAll(".nav-link").forEach((link) => {
     link.addEventListener("click", () => {
       document.querySelectorAll(".nav-link").forEach((node) => node.classList.remove("active"));
       link.classList.add("active");
       if (link.getAttribute("href") === "#published") loadDays();
+      if (link.getAttribute("href") === "#maintenance") loadMaintenance();
     });
   });
 
@@ -557,4 +696,5 @@
 
   finishUploadState();
   loadDays();
+  loadMaintenance();
 })();

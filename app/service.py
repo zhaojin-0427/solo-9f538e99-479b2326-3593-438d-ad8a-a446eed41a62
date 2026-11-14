@@ -3,21 +3,32 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date as date_type
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from .database import connect
-from .parsing import CsvFormatError, Observation, ParsedBatch, parse_csv
+from .parsing import (
+    MAX_STATION_LENGTH,
+    CsvFormatError,
+    Observation,
+    ParsedBatch,
+    parse_csv,
+)
 
 STATUS_PREVIEW = "preview"
 STATUS_PUBLISHED = "published"
 STATUS_STALE = "stale"
 STATUS_CONFLICT = "conflict"
+STATUS_BLOCKED = "blocked"
+
+MAX_MAINTENANCE_CONFLICTS = 100
 
 
 class AppError(Exception):
@@ -55,6 +66,32 @@ class PreviewNotPublishable(AppError):
     code = "preview_not_publishable"
 
 
+class InvalidMaintenanceWindow(AppError):
+    status_code = 400
+    code = "invalid_maintenance_window"
+
+
+class MaintenanceConflict(AppError):
+    """A new window would cover readings that are already published."""
+
+    status_code = 409
+    code = "maintenance_conflict"
+
+
+class MaintenanceBlocked(AppError):
+    """An uploaded batch has pending writes inside a maintenance window."""
+
+    status_code = 409
+    code = "maintenance_blocked"
+
+
+class PreviewBlocked(AppError):
+    """A window registered after the preview now covers its pending writes."""
+
+    status_code = 409
+    code = "preview_blocked"
+
+
 @dataclass(frozen=True)
 class ExistingRecord:
     revision: int
@@ -88,6 +125,237 @@ def _existing_records(
         )
         for row in rows
     }
+
+
+# ---------------------------------------------------------------------------
+# Maintenance windows (停机检修)
+#
+# A window is [start_ts, end_ts) over whole-hour local timestamps stored as
+# 'YYYY-MM-DDTHH:00:00', so lexicographic comparison is chronological. Both
+# registration and publication run inside BEGIN IMMEDIATE transactions, which
+# serialises them: whichever commits first forces the other to fail, so a
+# published record can never survive inside an effective window.
+# ---------------------------------------------------------------------------
+
+_WINDOW_HOUR = re.compile(
+    r"^(\d{4})-(\d{1,2})-(\d{1,2})[T ](\d{1,2})(?::(\d{1,2}))?(?::(\d{1,2}))?$"
+)
+
+
+def _parse_window_hour(value: Any, field: str) -> str:
+    """Validate a whole-hour datetime and normalise to 'YYYY-MM-DDTHH:00:00'."""
+    if not isinstance(value, str) or not value.strip():
+        raise InvalidMaintenanceWindow(
+            f"{field}不能为空",
+            details={"field": field, "code": "empty"},
+        )
+    text = value.strip()
+    match = _WINDOW_HOUR.match(text)
+    if not match:
+        raise InvalidMaintenanceWindow(
+            f"{field} {value!r} 格式无效，需为整点时间（如 2026-11-13T08:00）",
+            details={"field": field, "code": "invalid_format"},
+        )
+    year, month, day, hour = (int(match.group(i)) for i in (1, 2, 3, 4))
+    minute = int(match.group(5) or 0)
+    second = int(match.group(6) or 0)
+    if hour > 23 or minute != 0 or second != 0:
+        raise InvalidMaintenanceWindow(
+            f"{field} {value!r} 必须是整点（分钟和秒须为 0）",
+            details={"field": field, "code": "not_whole_hour"},
+        )
+    try:
+        parsed = datetime(year, month, day, hour)
+    except ValueError:
+        raise InvalidMaintenanceWindow(
+            f"{field} {value!r} 不是有效的日历时间",
+            details={"field": field, "code": "invalid_datetime"},
+        )
+    return parsed.strftime("%Y-%m-%dT%H:00:00")
+
+
+def _validate_window_station(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise InvalidMaintenanceWindow(
+            "站点不能为空",
+            details={"field": "station", "code": "empty"},
+        )
+    station = value.strip()
+    if len(station) > MAX_STATION_LENGTH:
+        raise InvalidMaintenanceWindow(
+            f"站点名称不得超过 {MAX_STATION_LENGTH} 个字符",
+            details={"field": "station", "code": "too_long"},
+        )
+    if any(ord(char) < 32 and char not in "\t" for char in station):
+        raise InvalidMaintenanceWindow(
+            "站点名称包含非法控制字符",
+            details={"field": "station", "code": "invalid_characters"},
+        )
+    return station
+
+
+def _window_dict(row: sqlite3.Row) -> dict:
+    return {
+        "id": row["id"],
+        "station": row["station"],
+        "start": row["start_ts"],
+        "end": row["end_ts"],
+        "created_at": row["created_at"],
+    }
+
+
+def register_maintenance(db_path: str | Path, payload: Any) -> dict:
+    """Register a maintenance window unless it covers published readings."""
+    if not isinstance(payload, dict):
+        raise InvalidMaintenanceWindow("请求体必须是 JSON 对象")
+    station = _validate_window_station(payload.get("station"))
+    start_ts = _parse_window_hour(payload.get("start"), "起始整点")
+    end_ts = _parse_window_hour(payload.get("end"), "结束整点")
+    if start_ts >= end_ts:
+        raise InvalidMaintenanceWindow(
+            "结束整点必须晚于起始整点（起始含、结束不含）",
+            details={"field": "end", "code": "empty_range"},
+        )
+
+    connection = connect(db_path)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            rows = connection.execute(
+                """
+                SELECT date, hour FROM published_records
+                WHERE station = ?
+                  AND date || 'T' || hour || ':00' >= ?
+                  AND date || 'T' || hour || ':00' < ?
+                ORDER BY date, hour
+                """,
+                (station, start_ts, end_ts),
+            ).fetchall()
+            if rows:
+                connection.rollback()
+                conflicts = [
+                    {
+                        "station": station,
+                        "date": row["date"],
+                        "hour": row["hour"],
+                        "timestamp": f"{row['date']}T{row['hour']}:00",
+                    }
+                    for row in rows[:MAX_MAINTENANCE_CONFLICTS]
+                ]
+                raise MaintenanceConflict(
+                    f"停机时段与 {len(rows)} 条已发布读数冲突，登记被拒绝",
+                    details={
+                        "station": station,
+                        "start": start_ts,
+                        "end": end_ts,
+                        "conflict_count": len(rows),
+                        "conflicts": conflicts,
+                    },
+                )
+            window_id = uuid.uuid4().hex
+            created_at = _utc_now()
+            connection.execute(
+                """
+                INSERT INTO maintenance_windows
+                    (id, station, start_ts, end_ts, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (window_id, station, start_ts, end_ts, created_at),
+            )
+            connection.commit()
+            return {
+                "id": window_id,
+                "station": station,
+                "start": start_ts,
+                "end": end_ts,
+                "created_at": created_at,
+            }
+        except BaseException:
+            try:
+                connection.rollback()
+            except sqlite3.Error:
+                pass
+            raise
+    finally:
+        connection.close()
+
+
+def list_maintenance(db_path: str | Path, station: str | None = None) -> dict:
+    connection = connect(db_path)
+    try:
+        if station:
+            rows = connection.execute(
+                """
+                SELECT * FROM maintenance_windows
+                WHERE station = ?
+                ORDER BY start_ts DESC, id
+                """,
+                (station,),
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                "SELECT * FROM maintenance_windows ORDER BY start_ts DESC, station, id"
+            ).fetchall()
+        return {"windows": [_window_dict(row) for row in rows]}
+    finally:
+        connection.close()
+
+
+def _maintenance_hits(
+    connection: sqlite3.Connection, date: str, writes: list[dict]
+) -> list[dict]:
+    """One entry per planned write whose timestamp falls inside a window."""
+    if not writes:
+        return []
+    day = date_type.fromisoformat(date)
+    day_start = f"{date}T00:00:00"
+    day_end = f"{day + timedelta(days=1)}T00:00:00"
+    stations = sorted({item["station"] for item in writes})
+    placeholders = ", ".join("?" for _ in stations)
+    rows = connection.execute(
+        f"""
+        SELECT id, station, start_ts, end_ts
+        FROM maintenance_windows
+        WHERE station IN ({placeholders})
+          AND start_ts < ? AND end_ts > ?
+        ORDER BY station, start_ts
+        """,
+        (*stations, day_end, day_start),
+    ).fetchall()
+    by_station: dict[str, list[sqlite3.Row]] = defaultdict(list)
+    for row in rows:
+        by_station[row["station"]].append(row)
+
+    hits: list[dict] = []
+    for item in writes:
+        timestamp = f"{date}T{item['hour']}:00"
+        for window in by_station.get(item["station"], []):
+            if window["start_ts"] <= timestamp < window["end_ts"]:
+                hits.append(
+                    {
+                        "station": item["station"],
+                        "hour": item["hour"],
+                        "timestamp": timestamp,
+                        "window_id": window["id"],
+                        "window_start": window["start_ts"],
+                        "window_end": window["end_ts"],
+                    }
+                )
+                break  # one hit per write is enough to reject the batch
+    return hits
+
+
+def _mark_preview_blocked(
+    connection: sqlite3.Connection, row: sqlite3.Row, hits: list[dict]
+) -> None:
+    """Persist the terminal blocked state, keeping the hits for later reads."""
+    public = json.loads(row["preview_json"])
+    public["status"] = STATUS_BLOCKED
+    public["maintenance_conflicts"] = hits
+    connection.execute(
+        "UPDATE previews SET status = ?, preview_json = ?, updated_at = ? WHERE id = ?",
+        (STATUS_BLOCKED, json.dumps(public, ensure_ascii=False), _utc_now(), row["id"]),
+    )
 
 
 def _record(
@@ -342,6 +610,27 @@ def create_preview(db_path: str | Path, raw: bytes) -> dict:
                     ),
                 )
 
+            # Pending writes inside a maintenance window reject the whole
+            # batch before any preview is persisted; published data is
+            # untouched either way.
+            hits = _maintenance_hits(connection, batch.date, plan["writes"])
+            if hits:
+                connection.rollback()
+                public = _public_preview(
+                    None,
+                    batch.date,
+                    version,
+                    plan,
+                    status=STATUS_BLOCKED,
+                    created_at=_utc_now(),
+                )
+                public["counts"] = {**plan["counts"], "pending": 0}
+                public["maintenance_conflicts"] = hits
+                raise MaintenanceBlocked(
+                    "批次中包含落入停机检修时段的待发布读数，整批已拒绝",
+                    details=public,
+                )
+
             preview_id = uuid.uuid4().hex
             created_at = _utc_now()
             public = _public_preview(
@@ -408,6 +697,13 @@ def get_preview(db_path: str | Path, preview_id: str) -> dict:
                     )
                     connection.commit()
                     row = _load_preview(connection, preview_id)
+                else:
+                    plan = json.loads(row["plan_json"])
+                    hits = _maintenance_hits(connection, row["date"], plan["writes"])
+                    if hits:
+                        _mark_preview_blocked(connection, row, hits)
+                        connection.commit()
+                        row = _load_preview(connection, preview_id)
             connection.commit()
             public = json.loads(row["preview_json"])
             public["status"] = row["status"]
@@ -453,6 +749,16 @@ def confirm_preview(db_path: str | Path, preview_id: str) -> dict:
                 connection.commit()
                 raise PreviewRejected("该批次存在冲突，已被整批拒绝，请修正后重新上传")
 
+            if status == STATUS_BLOCKED:
+                connection.commit()
+                stored = json.loads(row["preview_json"])
+                raise PreviewBlocked(
+                    "该预览的待发布读数落入停机检修时段，已失效，请重新上传 CSV",
+                    details={
+                        "maintenance_conflicts": stored.get("maintenance_conflicts", [])
+                    },
+                )
+
             if status != STATUS_PREVIEW:
                 connection.rollback()
                 raise PreviewNotPublishable("该预览状态不可确认")
@@ -471,6 +777,18 @@ def confirm_preview(db_path: str | Path, preview_id: str) -> dict:
 
             plan = json.loads(row["plan_json"])
             writes = plan["writes"]
+
+            # A maintenance window registered after this preview was created
+            # invalidates it permanently if any pending write falls inside.
+            hits = _maintenance_hits(connection, row["date"], writes)
+            if hits:
+                _mark_preview_blocked(connection, row, hits)
+                connection.commit()
+                raise PreviewBlocked(
+                    "该预览的待发布读数落入新登记的停机检修时段，已失效，请重新上传 CSV",
+                    details={"maintenance_conflicts": hits},
+                )
+
             now = _utc_now()
             batch_id = row["id"]
 
@@ -637,6 +955,10 @@ __all__ = [
     "AppError",
     "BatchConflict",
     "CsvFormatError",
+    "InvalidMaintenanceWindow",
+    "MaintenanceBlocked",
+    "MaintenanceConflict",
+    "PreviewBlocked",
     "PreviewNotFound",
     "PreviewRejected",
     "PreviewStale",
@@ -645,4 +967,6 @@ __all__ = [
     "get_day",
     "get_preview",
     "list_days",
+    "list_maintenance",
+    "register_maintenance",
 ]
